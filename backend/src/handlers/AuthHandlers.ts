@@ -1,0 +1,239 @@
+import { HttpApiBuilder, HttpServerRequest } from '@effect/platform'
+import { Effect, Option } from 'effect'
+import { AppApi } from '@api/AppApi'
+import { LoginUseCase } from 'src/usecase/auth/LoginUseCase'
+import { RefreshTokenUseCase } from 'src/usecase/auth/RefreshTokenUseCase'
+import { LogoutUseCase } from 'src/usecase/auth/LogoutUseCase'
+import { RegisterUserUseCase } from 'src/usecase/auth/RegisterUserUseCase'
+import { BootstrapUseCase } from 'src/usecase/auth/BootstrapUseCase'
+import {
+  appendAuthCookies,
+  appendClearAuthCookies,
+  extractRefreshTokenFromCookie,
+} from 'src/http/CookieHelper'
+import {
+  InvalidCredentials,
+  Unauthorized,
+  ValidationError,
+  BootstrapNotAllowed,
+  UserAlreadyExists,
+  UnprocessibleEntity,
+} from '@domain/http/HttpErrors'
+import { UserRepository } from 'src/repositories/UserRepository'
+import { CurrentUser } from '@domain/CurrentUser'
+import { AuthenticatedUser } from '@domain/Auth'
+
+/**
+ * Auth API Handlers
+ *
+ * Implements handlers for authentication endpoints using HttpApiBuilder.
+ * Automatically validates payloads and handles errors.
+ *
+ * Handlers set httpOnly cookies via appendPreResponseHandler for browser clients.
+ * Response body still includes tokens for backward compatibility with non-browser clients.
+ *
+ * Error mapping pattern:
+ * - Domain errors are caught and mapped to HTTP errors with status codes
+ * - Each error type is handled separately with appropriate messages
+ */
+export const AuthHandlersLive = HttpApiBuilder.group(AppApi, 'Auth', (handlers) =>
+  handlers
+    /**
+     * Login with email and password
+     * POST /api/auth/login
+     * Payload: LoginInput (automatically validated)
+     * Returns: AuthResponse (with accessToken, refreshToken, and user data)
+     * Errors: 400 (validation), 401 (invalid credentials)
+     *
+     * Note: Client should store tokens (accessToken in memory/sessionStorage,
+     * refreshToken in httpOnly cookie if supported)
+     */
+    .handle('login', ({ payload }) =>
+      Effect.gen(function* () {
+        const loginUseCase = yield* LoginUseCase
+
+        // Execute login use case and map errors
+        const result = yield* loginUseCase.execute(payload).pipe(
+          Effect.catchTags({
+            InvalidCredentialsError: () =>
+              new InvalidCredentials({ message: 'Invalid credentials' }),
+            PasswordError: () => new InvalidCredentials({ message: 'Invalid credentials' }),
+            InvalidTokenError: (cause) => new UnprocessibleEntity({ message: cause.message }),
+            SqlError: () => new UnprocessibleEntity({ message: 'Login failed' }),
+          })
+        )
+
+        // Set httpOnly cookies for browser clients
+        yield* appendAuthCookies(result.accessToken, result.refreshToken)
+
+        return result
+      })
+    )
+
+    /**
+     * Refresh access token
+     * POST /api/auth/refresh
+     * Payload: RefreshTokenInput (or refreshToken from Authorization header)
+     * Returns: AuthResponse (with new accessToken and refreshToken)
+     * Errors: 400 (validation), 401 (unauthorized)
+     *
+     * Note: Prefers refreshToken from Authorization header (bearer token)
+     * over request body for security
+     */
+    .handle('refresh', ({ payload }) =>
+      Effect.gen(function* () {
+        const refreshUseCase = yield* RefreshTokenUseCase
+        const request = yield* HttpServerRequest.HttpServerRequest
+
+        // Resolve refresh token: body takes priority, cookie is fallback
+        const cookieToken = extractRefreshTokenFromCookie(request)
+        const refreshToken = payload.refreshToken ?? Option.getOrUndefined(cookieToken)
+
+        if (!refreshToken) {
+          return yield* Effect.fail(new Unauthorized({ message: 'No refresh token provided' }))
+        }
+
+        const result = yield* refreshUseCase.execute({ refreshToken }).pipe(
+          Effect.catchTags({
+            InvalidTokenError: (cause) => new Unauthorized({ message: cause.message }),
+            RefreshTokenNotFoundError: (cause) => new Unauthorized({ message: cause.message }),
+            UserNotFoundError: () => new Unauthorized({ message: 'Malform refresh token' }),
+            SqlError: () => new UnprocessibleEntity({ message: 'Failed retrieve data' }),
+          })
+        )
+
+        // Set new httpOnly cookies for browser clients
+        yield* appendAuthCookies(result.accessToken, result.refreshToken)
+
+        return result
+      })
+    )
+
+    /**
+     * Logout and revoke refresh token
+     * POST /api/auth/logout
+     * Protected: Requires valid access token (via AuthMiddleware)
+     * Payload: LogoutInput (optional refreshToken and logoutAll flag)
+     * Returns: LogoutResult
+     * Errors: 401 (unauthorized)
+     *
+     * Note: CurrentUser is provided by AuthMiddleware and accessed by
+     * LogoutUseCase via CurrentUser.getOption internally.
+     */
+    .handle('logout', ({ payload }) =>
+      Effect.gen(function* () {
+        const logoutUseCase = yield* LogoutUseCase
+        const request = yield* HttpServerRequest.HttpServerRequest
+
+        // Extract refresh token from cookie or payload
+        const cookieToken = extractRefreshTokenFromCookie(request)
+        const refreshToken = Option.getOrUndefined(cookieToken) || payload.refreshToken
+
+        // Execute logout use case (CurrentUser context provided by middleware)
+        const result = yield* logoutUseCase
+          .execute({
+            refreshToken,
+            logoutAll: payload.logoutAll,
+          })
+          .pipe(
+            Effect.catchTags({
+              UnauthorizedError: () => new Unauthorized({ message: 'Invalid refresh token' }),
+              SqlError: () => new UnprocessibleEntity({ message: 'Logout failed' }),
+            })
+          )
+
+        // Clear httpOnly cookies
+        yield* appendClearAuthCookies()
+
+        return result
+      })
+    )
+
+    /**
+     * Register new user (create staff/admin account)
+     * POST /api/auth/register
+     * Protected: Requires valid access token (via AuthMiddleware)
+     * Payload: CreateUserInput (automatically validated)
+     * Returns: UserWithoutPassword
+     * Errors: 400 (validation), 401 (unauthorized), 409 (already exists)
+     *
+     * Note: Authentication is enforced by AuthMiddleware. Future enhancement
+     * could add role-based authorization (e.g., only admins can register users).
+     */
+    .handle('register', ({ payload }) =>
+      Effect.gen(function* () {
+        const registerUseCase = yield* RegisterUserUseCase
+
+        // Execute register use case and map errors
+        return yield* registerUseCase.execute(payload).pipe(
+          Effect.catchTags({
+            UserAlreadyExistsError: (cause) =>
+              new UserAlreadyExists({ message: 'User already exists', email: cause.email }),
+            PasswordError: (cause) => new ValidationError({ message: cause.message }),
+            SqlError: () => new UnprocessibleEntity({ message: 'Registration failed' }),
+          })
+        )
+      })
+    )
+
+    /**
+     * Bootstrap - Create first admin user
+     * POST /api/auth/bootstrap
+     * Public: No authentication required
+     * Payload: BootstrapInput (automatically validated)
+     * Returns: UserWithoutPassword
+     * Only works when no users exist in database
+     * Errors: 400 (validation), 409 (bootstrap not allowed)
+     */
+    .handle('bootstrap', ({ payload }) =>
+      Effect.gen(function* () {
+        const bootstrapUseCase = yield* BootstrapUseCase
+
+        // Execute bootstrap use case and map errors
+        return yield* bootstrapUseCase.execute(payload).pipe(
+          Effect.catchTags({
+            BootstrapNotAllowedError: (cause) =>
+              new BootstrapNotAllowed({ message: cause.message }),
+            PasswordError: () => new UnprocessibleEntity({ message: 'Failed to hash password' }),
+            UserAlreadyExistsError: (cause) => new UnprocessibleEntity({ message: cause.message }),
+            SqlError: () => new UnprocessibleEntity({ message: 'Bootstrap failed' }),
+          })
+        )
+      })
+    )
+
+    /**
+     * Get current authenticated user
+     * GET /api/auth/me
+     * Protected: Requires valid access token (via AuthMiddleware)
+     * Returns: AuthenticatedUser (without password or timestamps)
+     * Errors: 401 (unauthorized or user not found)
+     *
+     * Note: CurrentUser context is provided by AuthMiddleware. The JWT payload
+     * contains (id, email, role) but not name, so we fetch from database.
+     */
+    .handle('me', () =>
+      Effect.gen(function* () {
+        const currentUser = yield* CurrentUser
+        const userRepo = yield* UserRepository
+
+        // Fetch user by ID to get name field
+        const userOption = yield* userRepo.findById(currentUser.id)
+
+        // If user not found in database (edge case: user deleted after token issued)
+        if (Option.isNone(userOption)) {
+          return yield* Effect.fail(new Unauthorized({ message: 'User not found' }))
+        }
+
+        const user = userOption.value
+
+        // Return AuthenticatedUser (matches login response format)
+        return AuthenticatedUser.make({
+          id: user.id,
+          email: user.email,
+          name: user.name,
+          role: user.role,
+        })
+      })
+    )
+)
